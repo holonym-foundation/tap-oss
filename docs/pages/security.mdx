@@ -1,0 +1,77 @@
+# Security Model
+
+TAP asks for more trust than almost any other tool: your production API keys. This page explains why that trust doesn't rest on trusting us — it rests on hardware attestation enforced by Microsoft, and you can verify the chain yourself.
+
+## The short version
+
+Your credentials are encrypted before they're stored, and the key that decrypts them is held by Microsoft Azure's Key Vault HSM — which releases it **only to a hardware-verified TAP enclave running the exact, measured code we published**. Not to our employees. Not to our database. Not to anyone who compromises our cloud account. Microsoft's hardware checks who's asking, on every release.
+
+We don't ask you to believe we're careful. We ask you to check that we can't misbehave.
+
+## What your agent sees
+
+Nothing. Agents reference credentials by name (`X-TAP-Credential: slack`) or placeholder (`<CREDENTIAL:slack>`); the proxy injects the real value after policy checks and scrubs it from responses. No TAP API — agent-facing or admin-facing — ever returns a credential value. Credentials are **write-only**: encrypted on save, never readable again through any endpoint, dashboard, or export.
+
+## What we see
+
+Also nothing, and this is the part that matters. The chain of custody:
+
+1. **Your credential is encrypted with AES-256-GCM** the moment you save it. The ciphertext lives in our database; the database alone is useless.
+2. **The data-encryption key (DEK) exists in plaintext only inside the enclave** — an Azure confidential container running on AMD SEV-SNP hardware. It is never written to disk, never logged, never exported. At rest it exists only in wrapped (encrypted) form.
+3. **The key that unwraps the DEK (the KEK) lives in Azure Key Vault's HSM**, protected by a *Secure Key Release* policy. Key Vault will release it only when presented with a hardware attestation token, verified by Microsoft Azure Attestation, proving three things:
+
+```json
+{
+  "claim": "x-ms-attestation-type",   "equals": "sevsnpvm"             // real AMD SEV-SNP hardware
+}
+{
+  "claim": "x-ms-compliance-status",  "equals": "azure-compliant-uvm"  // Microsoft-validated utility VM
+}
+{
+  "claim": "x-ms-sevsnpvm-hostdata",  "equals": "<measurement>"        // the exact, hashed TAP image + config
+}
+```
+
+That last claim is the load-bearing one: `hostdata` is a hash of the complete container policy — the image digest, its command line, its environment. Change one byte of the running code and the measurement changes, attestation fails, and the key is not released.
+
+## What this rules out
+
+| Scenario | Outcome |
+|----------|---------|
+| TAP employee tries to read your credential | No path. The DEK never leaves enclave memory; humans can't attest as the enclave. |
+| Our database is stolen | Ciphertext only. The DEK needed to decrypt it is not in the database — it's wrapped under a key only the attested enclave can obtain. |
+| Our Azure account is compromised | Key Vault access control (RBAC) is **not sufficient** to release the key. Release requires hardware attestation, which an attacker with our cloud credentials cannot fake. |
+| Someone deploys a modified TAP image | New code → new measurement → attestation fails → Key Vault returns 403. The modified image cannot decrypt anything. |
+| A malicious or prompt-injected agent | Never had the credential in the first place — see [How It Works](/how-it-works#trust-model). |
+
+## Deploys can't sneak code in
+
+Authorizing a new TAP release to receive the key is itself a guarded ceremony, not an automatic side effect of deploying:
+
+- Every release's measurement is computed in CI and must be **explicitly authorized on the Key Vault release policy**, behind a protected environment requiring human approval. Approving a deploy *is* the act of authorizing that exact image.
+- Before authorization, the pipeline verifies the image's signature was produced by our deploy workflow on our `main` branch — pinned to the exact workflow identity, not just our organization.
+- The pipeline can only edit the release *policy*, never the key material, and old measurements are pruned after each rollout, so retired images lose access.
+- The vault has purge protection enabled: the key material cannot be destroyed, even by us, even accidentally.
+
+## Defense in depth
+
+Attestation protects custody. Independent layers protect usage — they apply even on self-hosted deployments without an enclave:
+
+- **Placeholder position validation** — a credential reference appearing anywhere except an auth position (e.g. in a tweet body or email text) is rejected outright. Agents can't exfiltrate a key through the target API.
+- **Response sanitization** — every upstream response is scanned for the credential value and its base64/URL-encoded variants before the agent sees it.
+- **Optional human approval** — an opt-in checkpoint you can require on any credential, with optional passkey step-up (`require_passkey`) for ones where a messaging-account compromise is unacceptable. Writes ask for approval as a safe default until you set a policy. See [Policies & Approval](/policies).
+- **Audit log** — every request, decision, and forward is recorded.
+- **Short-lived approval records** — request/response previews stored during approval are deleted as soon as the agent receives its decision.
+
+## Verify it yourself
+
+You don't have to take this page's word for it:
+
+- The attestation chain is standard Azure infrastructure you can read Microsoft's own documentation for: [Secure Key Release](https://learn.microsoft.com/en-us/azure/confidential-computing/concept-skr-attestation) with [Microsoft Azure Attestation](https://learn.microsoft.com/en-us/azure/attestation/overview) on [confidential containers](https://learn.microsoft.com/en-us/azure/container-instances/container-instances-confidential-overview).
+- The release policy gating our production key has exactly the three claims shown above.
+- **Every release's measurement is published** in the append-only [measurement transparency log](https://github.com/holonym-foundation/tap-oss/tree/main/measurements): `GET https://app.tap.human.tech/health` returns the running build's SHA, and the log maps that SHA to the exact image digest and `hostdata` measurement Microsoft enforces.
+- **The custody implementation is source-available** — read [`kms_azure.rs`](https://github.com/holonym-foundation/tap-oss/blob/main/crates/tap-proxy/src/kms_azure.rs) and [`skr.rs`](https://github.com/holonym-foundation/tap-oss/blob/main/crates/tap-proxy/src/skr.rs) yourself: it's the code this page describes.
+
+## Prefer to hold everything yourself?
+
+TAP is also [self-hostable](/deployment). The proxy, policy engine, and approval flows are the same; custody is yours end to end.

@@ -1,0 +1,149 @@
+{
+  "_comment": "Single source of truth for the recipe catalog. Consumed by the dashboard (Vite JSON import in dashboard/src/lib/recipes.js) and by the proxy (include_str! in src/recipes.rs, served to agents via /agent/services + /agent/recipes). The CLI catalog (tap-cli/src/recipe.rs) is a known duplicate — folding it onto this file is a follow-up.",
+  "recipes": [
+    {
+      "id": "invoice-payer",
+      "title": "Invoice payer",
+      "pitch": "Scan your email for invoices and pay them from your bank.",
+      "services": ["Gmail", "Mercury"],
+      "creds": [
+        {
+          "name": "gmail",
+          "label": "Gmail (read-only)",
+          "kind": "google",
+          "scopes": ["gmail-readonly"],
+          "note": "Reads your inbox to find invoices — it can never send or delete."
+        },
+        {
+          "name": "mercury",
+          "label": "Mercury",
+          "kind": "apikey",
+          "host": "api.mercury.com",
+          "keyUrl": "https://app.mercury.com/settings/tokens",
+          "keyHint": "Mercury → Settings → API tokens",
+          "note": "Pays approved invoices — every payment needs your passkey.",
+          "policy": { "requirePasskey": true }
+        }
+      ],
+      "taskPrompt": "You are an invoice assistant with TAP access to Gmail (read) and Mercury (payments). Search Gmail for unpaid invoices, extract the amount, payee, and due date for each, show me a summary, and — once I confirm — pay each via Mercury. Every payment is gated behind my passkey approval, so send them through TAP and wait for me to approve."
+    },
+    {
+      "id": "social-ghostwriter",
+      "title": "Social ghostwriter",
+      "pitch": "Drafts and publishes social posts — nothing goes out without your tap.",
+      "services": ["Mastodon", "Discord", "X"],
+      "flavors": [
+        {
+          "id": "mastodon",
+          "label": "Mastodon",
+          "sub": "Free API — access token",
+          "creds": [
+            {
+              "name": "mastodon",
+              "label": "Mastodon",
+              "kind": "apikey",
+              "host": "mastodon.social",
+              "keyUrl": "https://mastodon.social/settings/applications",
+              "keyHint": "Preferences → Development → New application (on another instance, edit the allowed host after)",
+              "note": "Reads your feed instantly; every status it posts waits for your tap."
+            }
+          ],
+          "taskPrompt": "You are my social ghostwriter with TAP access to Mastodon (credential 'mastodon'). Read my notifications and recent posts — reads are instant — then draft replies and posts. Publishing is the chokepoint: every status POST goes through TAP approval showing the exact text, so publish one at a time and wait for my tap before the next."
+        },
+        {
+          "id": "discord",
+          "label": "Discord",
+          "sub": "Free API — bot token",
+          "creds": [
+            {
+              "name": "discord-bot",
+              "label": "Discord bot",
+              "kind": "apikey",
+              "host": "discord.com",
+              "headerFormat": "Bot {value}",
+              "keyUrl": "https://discord.com/developers/applications",
+              "keyHint": "Developer portal → your app → Bot → Token",
+              "note": "Reads your channels instantly; every message it sends waits for your tap."
+            }
+          ],
+          "taskPrompt": "You are my community announcer with TAP access to a Discord bot (credential 'discord-bot'). Read the channels the bot can see to catch up — reads are instant — and draft the announcements or replies I ask for. Every message send goes through TAP approval showing the exact text, so post one at a time and wait for my tap before the next."
+        },
+        {
+          "id": "x",
+          "label": "X / Twitter",
+          "sub": "Paid API — OAuth 1.0a bundle",
+          "creds": [
+            {
+              "name": "twitter",
+              "label": "X / Twitter",
+              "kind": "twitter-bundle",
+              "keyUrl": "https://developer.x.com/en/portal/dashboard",
+              "keyHint": "Developer portal → your app → Keys and tokens",
+              "note": "Reads mentions instantly; every tweet it posts waits for your tap."
+            }
+          ],
+          "taskPrompt": "You are my social ghostwriter with TAP access to X/Twitter (credential 'twitter'). Read my mentions and timeline — reads are instant — then draft replies and tweets. Publishing is the chokepoint: every tweet POST goes through TAP approval showing the exact text, so publish one at a time and wait for my tap before the next."
+        }
+      ]
+    },
+    {
+      "id": "pr-ci-copilot",
+      "title": "PR & CI copilot",
+      "pitch": "Triages your PRs and CI; repo actions only run on your approval.",
+      "services": ["GitHub"],
+      "creds": [
+        {
+          "name": "github",
+          "label": "GitHub",
+          "kind": "apikey",
+          "host": "api.github.com",
+          "keyUrl": "https://github.com/settings/personal-access-tokens",
+          "keyHint": "Fine-grained token with Pull requests + Actions access",
+          "note": "Triage reads are instant; re-runs, merges, and comments wait for your tap."
+        }
+      ],
+      "taskPrompt": "You are my repo copilot with TAP access to the GitHub API (credential 'github'). Triage my repos: list open PRs, failing checks, and reviews waiting on me — reads are instant — and give me a \"what's blocking\" summary. When I ask you to act — re-run a failed workflow, merge an approved green PR, post a comment — each write goes through TAP approval, so fire it and wait for my tap before the next action."
+    },
+    {
+      "id": "support-refund-agent",
+      "title": "Support refund agent",
+      "pitch": "Reviews Stripe disputes and refunds customers — passkey on every refund.",
+      "services": ["Stripe"],
+      "creds": [
+        {
+          "name": "stripe",
+          "label": "Stripe",
+          "kind": "apikey",
+          "host": "api.stripe.com",
+          "keyUrl": "https://dashboard.stripe.com/apikeys",
+          "keyHint": "A test-mode key works for trying it",
+          "note": "Reads charges and disputes instantly — every refund needs your passkey.",
+          "policy": { "requirePasskey": true }
+        }
+      ],
+      "taskPrompt": "You are my support assistant with TAP access to Stripe (credential 'stripe'). Review recent charges and disputes — reads are instant — and flag which refund requests look legitimate, with your reasoning. Once I agree, process each refund via TAP: refunds are passkey-gated, so send the refund POST, then wait for me to approve it with my passkey. One refund at a time, never batch."
+    },
+    {
+      "id": "meeting-scheduler",
+      "title": "Meeting scheduler",
+      "pitch": "Negotiates meeting times over email and manages your calendar itself.",
+      "services": ["Gmail", "Calendar"],
+      "creds": [
+        {
+          "name": "google-scheduler",
+          "label": "Google (Gmail + Calendar)",
+          "kind": "google",
+          "scopes": ["gmail", "calendar"],
+          "note": "Emails invitees (every send waits for your tap) and manages events on its own.",
+          "policy": {
+            "autoApproveUrls": [
+              "www.googleapis.com/calendar/v3/freeBusy",
+              "www.googleapis.com/calendar/v3/calendars/primary/events"
+            ]
+          }
+        }
+      ],
+      "taskPrompt": "You are my scheduling assistant with TAP access to Google (credential 'google-scheduler': Gmail + Calendar). To schedule a meeting: check my calendar for free slots — reads are instant — then email the invitee two or three options. Every outgoing email is approval-gated, so send it via TAP and wait for my tap. Read their reply, and once a time is agreed, create the calendar event yourself with sendUpdates=none (event writes on my own calendar are auto-approved), then send a short confirmation email (gated, like every email). Never send an email without my approval; the calendar is yours to manage."
+    }
+  ]
+}

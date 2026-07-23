@@ -1,0 +1,297 @@
+# Self-Hosting
+
+Run TAP on your own infrastructure.
+
+Most users should start with [managed hosting at tap.human.tech](https://tap.human.tech). Self-hosting is available for teams with specific infrastructure, network, or compliance requirements.
+
+## Managed vs Self-Hosted
+
+TAP can run as a managed service or self-hosted. Both use the same proxy, the same API, and the same agent interface. From the agent's perspective, switching deployments means changing one URL.
+
+| Feature | Managed | Self-Hosted |
+|---------|---------|-------------|
+| Hardware enclave | Yes | No |
+| Encryption key management | Handled by enclave | You generate and manage |
+| Admin interface | Dashboard + API | CLI + team API (dashboard not included) |
+| TLS | Included | You configure |
+| Cost | Usage-based | Free (you pay for infra) |
+
+**Managed hosting** runs in hardware-attested enclaves — decryption keys exist in plaintext only inside enclave memory, and Azure Key Vault releases the unwrapping key only to the attested TAP image (see the [Security Model](/security)). Recommended for most users. Request access at [tap.human.tech](https://tap.human.tech), then use the [dashboard](https://app.tap.human.tech/dashboard).
+
+**Self-hosted** is open source under [Apache-2.0](https://github.com/holonym-foundation/tap-oss/blob/main/LICENSE): free to use, read, modify, and self-host. Full control, no external dependencies. You manage encryption keys, TLS, and updates. The hosted dashboard UI is proprietary and not in the OSS repo — self-hosted deployments are administered with the `tap` CLI and the team API (the proxy serves a placeholder page at `/dashboard`).
+
+**Self-hosting does not require an enclave or any Azure infrastructure.** The attestation/Secure-Key-Release code in the repository is compiled only with `--features enclave` — the default build (and the Docker setup below) reads a plain `TAP_ENCRYPTION_KEY` environment variable and runs anywhere Postgres does.
+
+---
+
+## Security Model for Self-Hosting
+
+This section matters most if you intend to store credentials that are genuinely sensitive — banking APIs, production infrastructure, OAuth tokens with broad account access.
+
+**The fundamental difference from managed hosting:**
+
+On managed hosting, the encryption key exists in plaintext only inside the hardware enclave's trusted execution environment — not the OS, not the hypervisor, not us; the key that unwraps it is released by Azure Key Vault only to the attested TAP image ([Security Model](/security)). An attacker with root on the host machine still cannot decrypt stored credentials.
+
+On self-hosted, the encryption key lives in your process environment. Root access to the server = read the key = decrypt every credential in the database. A secrets manager or Vault reduces the *surface* for key exposure but doesn't eliminate the risk: the running process still needs the key, so anything with access to process memory or environment variables can extract it.
+
+**Approaching enclave-level security**
+
+The closest self-hosted equivalent to what managed hosting provides is running TAP inside a **Trusted Execution Environment (TEE)**:
+
+- **AWS Nitro Enclaves** — hardware-isolated enclave with no persistent storage and no external network, key material derived inside and never exposed to the host
+- **Google Confidential Computing** (AMD SEV-SNP) — memory encrypted and isolated at hardware level from the hypervisor
+- **Azure Confidential Computing** (AMD SEV-SNP) — similar hardware-rooted isolation
+- **Intel TDX** — available on select cloud providers and bare metal
+
+With a TEE, the key can be derived or sealed inside the enclave so the host OS and hypervisor cannot read it — roughly equivalent to what managed hosting provides. This is the right choice if you need enclave-level guarantees and want full deployment control.
+
+**Next best: Hardware Security Module (HSM)**
+
+An HSM (AWS CloudHSM, Google Cloud HSM, Thales, YubiHSM) stores the key in tamper-resistant hardware. Cryptographic operations happen inside the HSM — the key material never exits. An attacker with root on the server can call HSM APIs but cannot extract the raw key bytes. This is meaningfully stronger than a software secrets manager (Vault, AWS Secrets Manager), which ultimately returns the key to the process.
+
+The gap versus an enclave: a fully compromised process could be made to call the HSM on the attacker's behalf — so HSM protects the key at rest and from offline theft, but not against a deeply compromised runtime.
+
+**If neither TEE nor HSM is an option**
+
+You're relying on server hardening as your primary defense. See the production checklist below. At this level, the security of stored credentials is only as strong as your ability to prevent root-level compromise of the host — plan accordingly.
+
+---
+
+## Self-Hosted Setup
+
+### Quickstart
+
+```bash
+git clone https://github.com/holonym-foundation/tap-oss
+cd tap-oss
+cp local.env.example .env
+# Edit .env — generate encryption key with: openssl rand -hex 32
+
+docker-compose -f docker-compose.yaml -f docker-compose.local.yaml up --build
+```
+
+The proxy listens on `localhost:3100`. Audit logs land in `./data/audit.jsonl`. There is no dashboard UI in the OSS build — configure everything with the bundled `tap` CLI:
+
+```bash
+# 1. Add a credential (stored AES-256-GCM-encrypted in Postgres)
+docker-compose exec proxy tap add \
+  --name openai --description "OpenAI API" \
+  --auth api-key --api-base https://api.openai.com \
+  --value sk-...your-key...
+
+# 2. (Optional — reads work without it.) Route write-approvals to a Telegram
+#    chat: create a bot via @BotFather, set TELEGRAM_BOT_TOKEN and
+#    TELEGRAM_CHAT_ID in .env, restart, then:
+docker-compose exec proxy tap channel set telegram
+
+# 3. Create an agent — prints its TAP API key once
+docker-compose exec proxy tap agent create --name my-agent --credentials openai
+```
+
+Then from your agent:
+
+```bash
+curl -s http://localhost:3100/forward \
+  -H "X-TAP-Key: <the-printed-agent-key>" \
+  -H "X-TAP-Credential: openai" \
+  -H "X-TAP-Target: https://api.openai.com/v1/models" \
+  -H "X-TAP-Method: GET"
+```
+
+Reads are auto-approved. Whether writes (POST/PUT/PATCH/DELETE) block on approval in your Telegram chat depends on the team's approval mode (new teams start autonomous; switch to gated on the Team page). Both defaults are per-credential policy you can change via the team API.
+
+### Production
+
+Includes nginx for TLS termination on port 443:
+
+```bash
+docker-compose up --build
+```
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| `proxy` | 3100 (internal) | TAP proxy |
+| `nginx` | 443 (public) | TLS termination |
+
+### TLS Setup
+
+1. Place your certificate and key in `deploy/certs/` (`cert.pem`, `key.pem`)
+2. Configure `deploy/nginx.conf` with your domain
+3. `docker-compose up --build`
+
+### Building from Source
+
+```bash
+cargo build --release
+# Binary at target/release/tap-proxy
+```
+
+Set environment variables (see below) and run directly.
+
+### Health Check
+
+```bash
+curl http://localhost:3100/health
+```
+
+No auth required. Docker Compose checks it every 30 seconds.
+
+---
+
+## Environment Variables
+
+### Proxy (Required)
+
+| Variable | Description |
+|----------|-------------|
+| `TAP_ENCRYPTION_KEY` | 64 hex chars (32 bytes). Used for HMAC-SHA256 agent key hashing and AES-256-GCM credential encryption. Generate with `openssl rand -hex 32` |
+| `POSTGRES_DATABASE_URL` | Postgres connection string (e.g. `postgres://tap:tap@localhost:5434/tap`; the local docker-compose provides this) |
+
+### Proxy (Optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TELEGRAM_BOT_TOKEN` | | Telegram bot token from [@BotFather](https://t.me/BotFather). Absent = Telegram approvals disabled. On a self-hosted (dashboard-less) deployment, Telegram or Matrix is how write-approvals reach you — reads work without either |
+| `TELEGRAM_CHAT_ID` | | Default Telegram chat ID for approval messages. Teams can configure their own via the dashboard or team API |
+| `MATRIX_HOMESERVER_URL` | | Matrix homeserver URL. In enclave deployments this can be removed after it has been sealed in the DB |
+| `MATRIX_ACCESS_TOKEN` | | Matrix bot access token. In enclave deployments this can be removed after it has been sealed in the DB |
+| `MATRIX_ROOM_ID` | | Optional default Matrix room ID. Teams can configure their own via the dashboard or team API |
+| `TAP_LISTEN_ADDR` | `0.0.0.0:3100` | Listen address |
+| `TAP_FORWARD_TIMEOUT_SECS` | `30` | Timeout for upstream API requests (seconds) |
+| `TAP_APPROVAL_TIMEOUT_SECS` | `3600` | Approval window for pending requests (seconds; default 1 hour) |
+| `TAP_CACHE_TTL_SECS` | `30` | Cache TTL for DB lookups (seconds) |
+| `TAP_AUDIT_LOG` | `./audit.jsonl` | Audit log path (the Docker setup sets `/data/audit.jsonl`) |
+| `CLAUDE_API_KEY` | | Anthropic API key enabling the AI assists: host suggestions for unrecognized keys in the .env importer (variable names only — secret values are never sent to the model). Absent = the importer's manual host field still works |
+| `RESEND_API_KEY` | | [Resend](https://resend.com) API key for transactional email (signup verification, team invites). Without it, invite links are shown in the dashboard for manual sharing, and local mode logs verification codes to the console |
+| `RESEND_FROM_EMAIL` | | From-address for transactional email |
+| `TELEGRAM_WEBHOOK_URL` / `TELEGRAM_WEBHOOK_SECRET` | | Switch Telegram from long-polling to webhook mode |
+| `TAP_VAPID_PRIVATE_KEY` / `TAP_VAPID_PUBLIC_KEY` | | VAPID keypair (base64url) enabling browser push notifications for dashboard approvals. Both must be set; absent = dashboard approvals are inbox-only. Generate with `npx web-push generate-vapid-keys` |
+| `TAP_VAPID_SUBJECT` | `mailto:approvals@tap.human.tech` | VAPID contact URI (`mailto:` or `https:`) |
+
+### WebAuthn (Optional)
+
+For passkey-based approval (Face ID, fingerprint, YubiKey):
+
+| Variable | Description |
+|----------|-------------|
+| `WEBAUTHN_RP_ID` | Relying party ID (e.g., `tap.human.tech`) |
+| `WEBAUTHN_RP_ORIGIN` | Relying party origin (e.g., `https://app.tap.human.tech`) |
+| `WEBAUTHN_ADDITIONAL_ORIGINS` | Comma-separated extra allowed origins |
+| `TAP_APP_URL` | Public dashboard/app URL used for passkey approval links (e.g., `https://app.tap.human.tech`). `TAP_APPROVAL_BASE_URL` overrides it for approval links specifically |
+
+---
+
+## CLI Reference
+
+The `tap` CLI manages credentials, agents, roles, and approval channels for self-hosted deployments. For managed hosting, use the dashboard or team API. In the Docker setup, prefix commands with `docker-compose exec proxy` so they run with the proxy's environment.
+
+All management commands use `--encryption-key` (or the `TAP_ENCRYPTION_KEY` env var) and connect to the database via `POSTGRES_DATABASE_URL`.
+
+### tap add
+
+Add a credential. Runs interactively (including the secret prompt) if `--name` is omitted.
+
+```bash
+tap add \
+  --name slack \
+  --description "Slack API" \
+  --auth api-key \
+  --api-base https://slack.com/api \
+  --value xoxb-...
+```
+
+| Flag | Description |
+|------|-------------|
+| `--name` | Credential name |
+| `--description` | Human-readable description |
+| `--auth` | Auth type: `api-key`, `oauth2`, `oauth1`, `custom`, `signing` |
+| `--api-base` | API base URL or sidecar URL |
+| `--relative-target` | Target is a relative path (for sidecars) |
+| `--value` | Secret value, stored encrypted in Postgres. For `oauth2`/`oauth1`/`signing`, pass the JSON bundle (e.g. `{"client_id":...,"client_secret":...,"refresh_token":...}` for Google) |
+
+### tap channel
+
+Route write-approvals for the deployment. Without a channel, writes return an approval link that points at the dashboard — which the OSS build doesn't have — so set one of these.
+
+```bash
+tap channel set telegram                         # uses TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+tap channel set matrix --room-id '!abc:matrix.org'
+tap channel list
+tap channel remove telegram
+```
+
+### tap status
+
+Check proxy health.
+
+```bash
+tap status [--proxy-url http://localhost:3100]
+```
+
+### tap logs
+
+Display formatted audit log entries.
+
+```bash
+tap logs [--log-file ./audit.jsonl] [--tail 20]
+```
+
+### tap agent
+
+```bash
+tap agent list                           # List all agents
+tap agent create --name my-agent \       # Create agent (prints API key once)
+  --credentials slack,github \
+  --rate-limit 100
+tap agent show my-agent                  # Show agent details + effective permissions
+tap agent enable my-agent                # Re-enable a disabled agent
+tap agent disable my-agent               # Disable (rejects all requests)
+tap agent delete my-agent                # Delete
+```
+
+### tap role
+
+```bash
+tap role list                            # List all roles
+tap role create --name reader \          # Create role
+  --credentials slack,github \
+  --rate-limit 50
+tap role add-credential reader slack     # Grant credential to role
+tap role remove-credential reader slack  # Revoke credential from role
+tap role delete reader                   # Delete (cascades to agents)
+```
+
+---
+
+## Production Checklist
+
+**Encryption key**
+- [ ] Key generated with `openssl rand -hex 32` — not copied from documentation or examples
+- [ ] Key stored in a secrets manager (AWS Secrets Manager, GCP Secret Manager, HashiCorp Vault) or HSM — not in a `.env` file on disk
+- [ ] If using a TEE or HSM, key derivation/sealing happens inside the hardware boundary
+- [ ] Key rotation plan documented (requires re-encrypting all credential values)
+
+**Server hardening**
+- [ ] Dedicated host or container — no other workloads sharing the process space
+- [ ] TAP proxy runs as a non-root user with minimal filesystem permissions
+- [ ] Unnecessary ports closed; proxy port not exposed directly to the internet (behind nginx/load balancer)
+- [ ] SSH restricted to key-only auth; consider disabling SSH in favor of deploy-only immutable infrastructure
+- [ ] OS-level sandboxing enabled (AppArmor, SELinux, or a custom seccomp profile)
+- [ ] Database file on encrypted storage (dm-crypt/LUKS, cloud encrypted volume)
+- [ ] Database file not readable by any user other than the proxy process
+
+**TLS and networking**
+- [ ] TLS enabled with a valid certificate (Let's Encrypt, internal CA)
+- [ ] TLS 1.2 minimum; TLS 1.3 preferred
+- [ ] Team/admin API endpoints not exposed to the public internet if not needed
+
+**Monitoring**
+- [ ] Audit log shipped to a separate, append-only store (so a compromised host cannot erase evidence)
+- [ ] Alerting on approval denials, rate limit hits, and access to high-sensitivity credentials
+- [ ] Log retention policy set
+
+**Access control**
+- [ ] Unique API key per agent — never share keys between agents
+- [ ] Policies configured per credential — start restrictive, whitelist only what agents need
+- [ ] `allowed_approvers` set for credentials with broad account access
+- [ ] Rate limits configured for all agents

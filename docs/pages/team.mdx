@@ -1,0 +1,59 @@
+# Team Members
+
+TAP is multi-user. Owners and admins manage workspace configuration, while approvers can review requests and create their own API keys for credentials assigned to them.
+
+## Inviting a member
+
+Go to **Team** in the dashboard sidebar and enter a colleague's email address. Choose the role before sending the invite. TAP sends them an invitation link valid for 48 hours.
+
+If email delivery fails (e.g. `RESEND_API_KEY` not configured), the dashboard shows the accept URL so you can share it manually.
+
+## Accepting an invitation
+
+New users can accept the invite link, set a password, and join the inviting team. Existing users are sent to login; after login, TAP accepts the pending invite and starts their session in the team that invited them.
+
+If someone signs up from the normal signup screen with a pending invite, the dashboard shows the invited team and lets them either join only that team or create their own workspace too.
+
+## Roles
+
+| Role | Can do |
+|------|--------|
+| **Owner** | Everything. Cannot be removed. |
+| **Admin** | Manage credentials, agents, policies, notification channels, billing, and team members. Cannot grant owner access. |
+| **Approver** | View assigned credential metadata, review approval requests for assigned credentials, create and manage their own API keys for those credentials, manage their own profile and passkeys, and view team membership. |
+
+The first person to sign up for a workspace becomes the owner. Invites default to approver. Approvers start with no credential access; assign credentials from the member row after they accept.
+
+## Credential access
+
+Owners and admins can open **Credential Access** from an approver's row on the **Team** page. Assigned credentials are the only credentials that approver can see in the dashboard, approve requests for, or attach to API keys they create for their own agents.
+
+To grant several credentials at once, use **Apply credentials from a role** in the same dialog: picking a [role](/team#roles) copies its current credentials into the selection. This is a one-time snapshot, not a link — the approver is granted the individual credentials, so editing the role afterward does not change what that approver can approve. Review the selection and **Save access** to apply.
+
+Credential access for a person does not reveal the raw secret value and does not grant policy editing, credential editing, role management, team-wide agent management, or team settings. Owners and admins still manage all API keys. Approvers see only API keys they created themselves, and those keys can use direct credential assignments only, not roles.
+
+## Removing a member
+
+On the **Team** page, click **Remove** next to any non-owner member. Their sessions are invalidated immediately. The owner cannot be removed — transfer ownership by contacting support.
+
+## Cancelling a pending invite
+
+Pending invites appear below the member list. Click **Cancel** to revoke the link before it is accepted. After acceptance, use **Remove** instead.
+
+## API
+
+For programmatic team management:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/team/members` | List members and pending invites |
+| `POST` | `/team/members/invite` | Send an invite (`{"email": "...", "role": "approver"}`; `role` is optional — `approver`, `admin`, or `owner`, defaults to `approver`; only owners can invite as owner) |
+| `GET` | `/invite/info?token=` | Look up invite metadata (email, team name, next step) without consuming the token. No auth required |
+| `POST` | `/team/members/accept` | Accept an invite (`{"token": "...", "password": "..."}`). Creates brand-new accounts only — existing users log in instead, which consumes the pending invite |
+| `PUT` | `/team/members/{id}/role` | Change a member's role (`{"role": "..."}`). Owner-only |
+| `DELETE` | `/team/members/{id}` | Remove a member |
+| `DELETE` | `/team/members/invites/{id}` | Cancel a pending invite |
+| `POST` | `/team/members/{id}/credentials` | Assign a credential to an approver |
+| `DELETE` | `/team/members/{id}/credentials/{name}` | Remove an approver credential assignment |
+
+All endpoints except `accept` and `/invite/info` require a valid session token (`Authorization: Bearer <token>`).

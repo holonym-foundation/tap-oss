@@ -1,0 +1,20 @@
+{
+  "name": "tap-docs",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "^15.1.0",
+    "nextra": "^3.2.0",
+    "nextra-theme-docs": "^3.2.0",
+    "posthog-js": "^1.393.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "25.5.0"
+  }
+}

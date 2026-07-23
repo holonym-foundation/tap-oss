@@ -1,0 +1,75 @@
+# Policies & Approval
+
+Approval is optional and configured per credential in the dashboard on the **Policies** page. You can run a credential fully autonomously, auto-approve by method or URL, or require a human checkpoint on the calls that matter — it's your choice per credential.
+
+## Default Behavior
+
+Until you set a policy, TAP errs on the safe side: GET and HEAD requests are auto-approved, and all other methods (POST, PUT, PATCH, DELETE) ask for approval. Add a policy to loosen or tighten this for any credential — for example, auto-approve every method to let an agent run unattended.
+
+Once you add a policy for a credential, the defaults no longer apply — the proxy uses only what you've configured, falling back to requiring approval for any method not listed.
+
+## Team Default Approval Mode
+
+The **Team** page has a workspace-wide default that governs credentials which don't have their own policy:
+
+- **Gated**: the safe behavior above — reads auto-approve, writes ask for approval. Teams created before the
+  autonomous default, and any team that switches back, sit here.
+- **Autonomous**: credentials with no policy auto-approve everything, so agents run unattended.
+
+This only affects credentials that have **no explicit policy** — a per-credential policy always wins over the team default, so you can flip the workspace to Autonomous and still pin a sensitive credential (a prod key, a payments token) to require approval. Credential isolation, `allowed_hosts` binding, and the SSRF guard stay on in both modes, and `/sign` (signing keys) always requires approval regardless. Only workspace managers can change the mode.
+
+## Policy Evaluation Order
+
+When a request arrives, the proxy evaluates rules in this order:
+
+1. **Require URL patterns** — if the target URL structurally matches any `require_approval_urls` pattern, require human approval regardless of broader auto URL or method rules. Use these as safety overrides for destructive subpaths.
+2. **Auto URL patterns** — if no require URL matched and the target URL structurally matches any `auto_approve_urls` pattern, auto-approve regardless of HTTP method. Values starting with `/` match the URL path prefix; other values require an exact host before matching the path prefix. In paths, `*` matches exactly one non-empty segment. Query strings and fragments do not participate.
+3. **Method rules** — if the HTTP method is in `auto_approve_methods`, auto-approve. HEAD follows GET policy
+4. **Require approval** — if the method is in `require_approval_methods`, require human approval
+5. **Default** — if the method isn't in either list, require approval
+
+Example: a policy with `auto_approve_methods: ["GET"]` and `auto_approve_urls: ["/conversations.list"]` means `POST /conversations.list` is auto-approved (URL match), but `POST /chat.postMessage` requires approval (method rule). For dynamic path segments, use `*`: `api.github.com/repos/*/*/git/refs` matches branch-ref creation for any owner/repo on `api.github.com`.
+
+For safety overrides, pair a broader auto URL with a narrower require URL. For example, `auto_approve_urls: ["api.github.com/repos/*/*/git/refs"]` can allow branch creation while `require_approval_urls: ["api.github.com/repos/*/*/git/refs/heads"]` keeps branch deletes and force-updates gated.
+
+## Approval Channels
+
+When approval is required, the agent immediately receives a `202` response with an approval link and a transaction ID it polls for the outcome — see the [API Reference](/proxy-api#post-forward). The request stays pending until an approver responds or the approval window expires (default 1 hour, configurable via `TAP_APPROVAL_TIMEOUT_SECS` on self-hosted deployments).
+
+**No setup is required.** By default, the agent relays the approval link to you inline, and the request also appears in the dashboard **Approvals** inbox. To route approval prompts elsewhere, add a channel on the **Approvals** page in the dashboard.
+
+### Agent-reflected links (default)
+
+The approval URL is returned to the agent, which shows it to you in the conversation. Click through, sign in, and approve. Zero setup — this is what TAP uses when no channel is configured. The request also lands in the dashboard inbox as a fallback.
+
+### Dashboard inbox + web push
+
+Approval requests appear under **Approvals** in the dashboard. Enable browser notifications on a device to get a web push notification even with the tab closed.
+
+### Telegram
+
+Add [@vaulty_tap_bot](https://t.me/vaulty_tap_bot) to a Telegram chat or group, then paste the chat ID into the dashboard. The proxy sends a message with the agent name, credential, HTTP method, target URL, body preview, and **Approve** / **Deny** buttons.
+
+**Long-polling vs webhook:** By default, the proxy polls Telegram's API with a 30-second timeout (works behind NAT). For production with a public URL, configure Telegram webhooks — the proxy handles callbacks at `POST /telegram/webhook`.
+
+### Matrix
+
+Invite [@vaulty:matrix.org](https://matrix.to/#/@vaulty:matrix.org) to a Matrix room, then paste the room ID into the dashboard. The proxy sends the same request details with Approve / Deny options.
+
+### Passkey (WebAuthn)
+
+For hardware-backed approval via Face ID, fingerprint, or YubiKey. When enabled for a credential, dashboard approvals open a passkey challenge in the dashboard, and external approval messages include a secure URL. The approver must be signed in, eligible for that credential, and registered under **Security** before the passkey approval can complete.
+
+## Per-Credential Routing
+
+You can further restrict who can approve and route approval messages to different channels per credential. Configure these under each credential's policy settings.
+
+- **allowed_approvers** — list of team member emails. Only those eligible people can approve. Empty = any eligible approver for the credential can approve. Owners and admins are eligible for every credential; approvers are eligible only for credentials assigned to them on the Team page.
+- **Per-credential channel** — route this credential's approvals to a specific channel (`dashboard`, `agent_reflected`, `telegram`, or `matrix`), overriding the team default.
+- **Per-credential Telegram chat** — overrides the default Telegram chat for this credential's approval messages. Useful for routing sensitive credentials to a restricted group.
+- **Per-credential Matrix room** — overrides the default Matrix room for this credential's approval messages.
+- **min_approvals** — number of approvers who must approve before the request proceeds. Default is 1.
+
+## Rate Limiting
+
+You can set a per-agent rate limit when creating or editing an agent in the dashboard. When the limit is exceeded, the proxy returns `429 Too Many Requests`. Limits reset on a rolling 1-hour window. Leaving the limit blank means no cap.

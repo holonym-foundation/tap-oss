@@ -1,0 +1,17 @@
+Tool Authorization Protocol (TAP)
+Copyright 2026 Holonym Foundation
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party software under their own licenses. Most
+dependencies are MIT or Apache-2.0. Notable non-permissive (but Apache-
+compatible) dependencies:
+
+  - webauthn-rs and related crates (base64urlsafedata, ece,
+    webauthn-attestation-ca, webauthn-rs-core, webauthn-rs-proto) are
+    licensed under MPL-2.0. MPL-2.0 is file-level copyleft and is used here
+    as an unmodified dependency; it imposes no copyleft obligation on TAP's
+    own Apache-2.0 source.
+
+See LICENSING.md for the open-core boundary between the Apache-2.0 crates and
+the proprietary hosted-service components.

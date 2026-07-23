@@ -1,0 +1,46 @@
+# Tool Authorization Protocol
+
+Every API call an agent makes carries your credentials. TAP replaces raw tokens with named credential references the agent can't read, so a leaked, jailbroken, or prompt-injected agent has nothing to steal or misuse.
+
+TAP sits between agents and services: agents reference credentials by name, and TAP resolves and injects the real token without surfacing it. On top of that, you can add an approval checkpoint on any credential where you want a human in the loop — the approver sees the full payload before the request is forwarded.
+
+## Before and After
+
+Your agent's code barely changes:
+
+```
+# Before: agent holds the raw credential
+Authorization: Bearer xoxb-your-slack-bot-token
+
+# After: agent uses a name, TAP handles the rest
+X-TAP-Credential: slack
+X-TAP-Target: https://slack.com/api/chat.postMessage
+X-TAP-Method: POST
+```
+
+- **Credential isolation** — agents never see actual secret values, so a jailbroken or compromised agent can't exfiltrate your Gmail, Slack, or Mercury tokens. This is on for every credential, always.
+- **Response sanitization** — if an API response includes your token (e.g. an OAuth introspection endpoint), TAP strips it before the agent sees it
+- **Optional human-in-the-loop approval** — turn on an Approve / Deny checkpoint (dashboard, Telegram, Matrix, or passkey) for any credential where you want one. TAP sends the exact payload before the request goes through. Configurable per credential.
+- **Audit trail** — every request logged with agent, credential, approval status, and latency
+
+**Managed hosting** at [tap.human.tech](https://tap.human.tech) is the recommended way to get started. [Self-hosting](/deployment) is [source-available under FSL](https://github.com/holonym-foundation/tap-oss) (free to use and self-host; MIT two years after each release).
+
+## Get Started
+
+Already have dashboard access? Give your agent these two lines:
+
+```text
+TAP API key: <API key from the dashboard>
+TAP instructions: https://proxy.tap.human.tech/instructions
+```
+
+Your agent fetches that URL and discovers how to use your configured services — no custom integration code needed.
+
+---
+
+- [Quickstart](/quickstart) — the five-minute first run: sign up, add a credential, connect your agent
+- [Credential Setup Guides](/credential-setup) — how to get keys for Gmail, Twitter/X, Slack, Telegram, Mercury, and others
+- [Policies & Approval](/policies) — choose which requests run automatically and which have more complex policies
+- [How It Works](/how-it-works) — architecture and request flow
+- [API Reference](/proxy-api) — full endpoint documentation
+- [Self-Hosting](/deployment) — run TAP on your own infrastructure

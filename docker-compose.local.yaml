@@ -1,0 +1,41 @@
+# Local development override — no nginx, no TLS, exposes proxy directly.
+# Usage:
+#   cp local.env.example .env   # fill in real values
+#   docker-compose -f docker-compose.yaml -f docker-compose.local.yaml up --build
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tap
+      POSTGRES_USER: tap
+      POSTGRES_PASSWORD: tap
+    ports:
+      - "5434:5432"
+    volumes:
+      - tap-local-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tap"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  proxy:
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - POSTGRES_DATABASE_URL=postgres://tap:tap@postgres:5432/tap
+      - DANGEROUS_TAP_DEV_SKIP_AUTH=true
+
+  # Disable nginx for local dev
+  nginx:
+    profiles:
+      - production
+
+volumes:
+  tap-local-db:

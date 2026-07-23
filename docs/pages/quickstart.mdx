@@ -1,0 +1,76 @@
+# Quickstart
+
+## 1. Sign up
+
+Go to [tap.human.tech](https://tap.human.tech) and create an account.
+
+## 2. Add your credentials
+
+**Fastest path — import your `.env`.** If your keys already live in a `.env` file, go to **Credentials** → **Import from .env** (also offered as the first step of onboarding): paste the file, TAP recognizes the keys inside (OpenAI, Anthropic, Stripe, GitHub, Slack, AWS, and ~25 others), names each credential, and binds it to its service's API host. Unrecognized keys get an AI-suggested host binding to verify (the variable *name* is all that's analyzed — values never leave the create path). You review the list and pick what to import; everything is stored encrypted. Once your agent talks to TAP, you can delete the raw keys from the `.env`. Details: [Import from .env](/credential-setup#import-from-env).
+
+Or add one at a time: in the dashboard, go to **Credentials** → **+ Add Credential**.
+
+Most services use **Standard API Key** — give it a name, paste the secret. Common ones:
+
+| Service | Where to find your key |
+|---------|----------------------|
+| Mercury | [app.mercury.com/settings/tokens](https://app.mercury.com/settings/tokens) |
+| Stripe | [dashboard.stripe.com/apikeys](https://dashboard.stripe.com/apikeys) |
+| AWS | [console.aws.amazon.com/iam](https://console.aws.amazon.com/iam/) → Security credentials |
+| GitHub | [github.com/settings/tokens](https://github.com/settings/tokens?type=beta) |
+| Notion | [notion.so/my-integrations](https://www.notion.so/my-integrations) → New integration → Copy Internal Integration Secret |
+| Slack | [api.slack.com/apps](https://api.slack.com/apps) → OAuth & Permissions → Bot User OAuth Token |
+
+For Google (Gmail, Calendar, Drive, Workspace admin, Google Cloud), the dashboard has a guided browser OAuth flow. X/Twitter uses one credential that can hold both a Bearer Token for search/counts and OAuth 1.0a fields for account actions. Telegram has a dedicated setup wizard — see [Credential Setup Guides](/credential-setup).
+
+## 3. Create an API key
+
+Go to **API Keys** → **+ Create API Key**. Give it a name and select which credentials it can access.
+
+**Copy the API key — it's shown only once.**
+
+To add colleagues, go to **Team** → enter their email. See [Team Members](/team).
+
+## 4. Connect your agent
+
+Give your agent these two lines — in its context, memory, or just pasted into the conversation (e.g. in CLAUDE.md or a skill):
+
+```text
+TAP API key: <YOUR API KEY>
+TAP instructions: https://proxy.tap.human.tech/instructions
+```
+
+The agent fetches that URL, learns the protocol, and discovers your configured services — works with any instruction-following model.
+
+## 5. Try it
+
+Ask your agent: *"List my available TAP services."*
+
+Then pick something from the [Examples](/examples) page — copy a prompt, paste it, and watch the approval flow in action.
+
+**Approvals work out of the box — no setup needed.** Reads go through immediately. New teams start in **autonomous** mode, so writes also run straight through; switch the team to **gated** on the Team page and writes pause for your approval. When the agent makes a write, it gets back an approval link to show you right in the conversation, and the same request appears in the dashboard under **Approvals**. Approve in either place and the request goes through.
+
+## Optional: approval notifications
+
+Want approval prompts pushed to you instead? Go to **Approvals** in the dashboard and add a channel:
+
+- **Dashboard inbox + browser notifications** — get a web push notification on that device even with the tab closed
+- **Telegram** — add [@vaulty_tap_bot](https://t.me/vaulty_tap_bot) to a Telegram chat or group, then paste the chat ID into the dashboard
+- **Matrix** — invite [@vaulty:matrix.org](https://matrix.to/#/@vaulty:matrix.org) to a Matrix room, then paste the room ID into the dashboard
+
+With Telegram or Matrix, TAP sends you a message like:
+
+> **Agent:** my-agent · **Credential:** slack · **Action:** POST /chat.postMessage  
+> `{"channel": "C123456", "text": "Hello team, the deploy is done"}`  
+> ✅ Approve &nbsp; ❌ Deny
+
+**Optional: passkey approval.** Approve with Face ID, a fingerprint, or a YubiKey instead of tapping in chat. Register passkeys under **Security**, then enable passkey approval in a credential's policy. See [Policies & Approval](/policies).
+
+Add custom policies in [Policies & Approval](/policies).
+
+---
+
+- [Credential Setup Guides](/credential-setup) — Gmail, X/Twitter, Telegram, Mercury, and others
+- [Policies & Approval](/policies) — customize approval rules per credential
+- [How It Works](/how-it-works) — architecture and trust model
+- [Self-Hosting](/deployment) — run TAP on your own infrastructure

@@ -1,0 +1,89 @@
+version: "3.8"
+
+services:
+  proxy:
+    build: .
+    ports:
+      - "3100:3100"
+    volumes:
+      - audit-data:/data
+    environment:
+      - TAP_AUDIT_LOG=/data/audit.jsonl
+      - TAP_LISTEN_ADDR=0.0.0.0:3100
+      # Set these in .env or pass via docker-compose --env-file
+      - TAP_ENCRYPTION_KEY
+      - TELEGRAM_BOT_TOKEN
+      - TELEGRAM_CHAT_ID
+      # API keys (one per agent registered via admin API)
+      - TAP_API_KEY_OPENCLAW
+      - TAP_API_KEY_RESEARCH_BOT
+      # Credential values
+      - TAP_CRED_TWITTER_HOLONYM
+      - TAP_CRED_GMAIL_HOLONYM
+      - TAP_CRED_OPENAI_KEY
+      # PostgreSQL connection string (Supabase in prod, local postgres in dev)
+      - POSTGRES_DATABASE_URL
+      # PROXY-ONLY authority key. Signs and verifies the short-lived passkey
+      # authorization assertions AND the MCP OAuth access/refresh tokens. It must
+      # NOT be set on the mcp service below: HMAC is symmetric, so a copy there
+      # would let that internet-facing process forge a token for any team/agent.
+      - TAP_MCP_SIGNING_KEY
+      # tap-mcp's own key, held here VERIFY-ONLY so the connect screen can show
+      # which client is asking. Must be a DIFFERENT value from the key above.
+      - TAP_MCP_LOCAL_KEY
+      - TAP_MCP_PUBLIC_URL
+      # Shared secret authenticating tap-mcp to the /internal/mcp endpoints that
+      # back its durable OAuth token state. MUST match the value on the mcp
+      # service below. Unset/empty here ⇒ those endpoints are disabled (404).
+      # Deliberately NOT the same key as TAP_MCP_SIGNING_KEY.
+      - TAP_MCP_SERVICE_KEY
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3100/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    ports:
+      - "3200:3200"
+    environment:
+      - TAP_MCP_LISTEN_ADDR=0.0.0.0:3200
+      - TAP_MCP_PUBLIC_URL
+      - TAP_DASHBOARD_URL
+      # tap-mcp's OWN key — signs only the artifacts it also verifies (signed
+      # authorization request, DCR client id, authorization code). There is
+      # deliberately NO TAP_MCP_SIGNING_KEY here: this service cannot mint or
+      # verify access/refresh tokens, it asks the proxy to via
+      # /internal/mcp/token/{issue,refresh}. Must differ from TAP_MCP_SIGNING_KEY.
+      - TAP_MCP_LOCAL_KEY
+      # TAP proxy the MCP tools (tap_discover/tap_call) call on the user's behalf.
+      # Also carries this service's durable OAuth token state via /internal/mcp —
+      # tap-mcp holds NO database credentials (it runs outside the enclave
+      # boundary), so there is deliberately no POSTGRES_DATABASE_URL here.
+      - TAP_PROXY_URL=http://proxy:3100
+      # Must match TAP_MCP_SERVICE_KEY on the proxy service above.
+      - TAP_MCP_SERVICE_KEY
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3200/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+    depends_on:
+      - proxy
+    restart: unless-stopped
+
+volumes:
+  audit-data:

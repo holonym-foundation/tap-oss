@@ -1,0 +1,1141 @@
+# API Reference
+
+TAP exposes three groups of endpoints: **agent endpoints** (authenticated via `X-TAP-Key`), **admin auth endpoints** (public), and **admin CRUD endpoints** (authenticated via `Authorization: Bearer <session_token>`).
+
+---
+
+## Agent Endpoints
+
+These endpoints are used by AI agents. All except `/health` require the `X-TAP-Key` header.
+
+Recommended agent flow:
+
+1. Fetch `/instructions` to learn the setup flow.
+2. Ask the user for the one-time agent API key from the dashboard.
+3. Call `/agent/bootstrap` to verify the key and setup state.
+4. Call `/agent/services` to discover usable credentials and request templates.
+5. Send requests through `/forward`.
+
+### GET /instructions
+
+Public agent setup metadata, served as plain text. Intentionally unauthenticated so a user can give an agent only the TAP proxy URL and the agent can learn where to send the human next. (`GET /` on the bare proxy domain redirects to the dashboard.)
+
+```bash
+curl https://proxy.tap.human.tech/instructions
+```
+
+**Response** (plain text):
+
+```
+# TAP — Tool Authorization Proxy
+Proxy: https://proxy.tap.human.tech
+
+Credential proxy for AI agents. Agents forward API calls; TAP injects credentials.
+
+## Quick start
+
+1. GET https://proxy.tap.human.tech/agent/services  (header: X-TAP-Key)
+2. POST https://proxy.tap.human.tech/forward
+
+## POST /forward headers
+
+  X-TAP-Key: <api-key>            required
+  X-TAP-Target: <upstream URL>    required (full https:// URL)
+  X-TAP-Method: GET|POST|…        required (upstream HTTP method)
+  X-TAP-Credential: <service>     required (name from /agent/services)
+Only documented X-TAP-* headers exist. Others return 400.
+Always POST to /forward, even for upstream GETs.
+Non-TAP headers forward verbatim. Body goes in HTTP body (no X-TAP-Body).
+
+## Requesting a new credential
+
+POST /agent/credential-link with {name, ...} (no secret) to get a
+prefilled setup link to hand your user. See below.
+...
+```
+
+### GET /agent/bootstrap
+
+Authenticated setup check for agents. Use this immediately after the user provides an agent API key. This endpoint does not expose secrets; it only tells the agent whether the key is usable and what to do next.
+
+```bash
+curl https://proxy.tap.human.tech/agent/bootstrap \
+  -H "X-TAP-Key: $MY_KEY"
+```
+
+**Ready response:**
+
+```json
+{
+  "protocol": "tap",
+  "version": 1,
+  "status": "ready",
+  "agent_id": "my-agent",
+  "team_id": "abc-123",
+  "credential_count": 2,
+  "dashboard_url": "https://proxy.tap.human.tech/dashboard",
+  "services_url": "/agent/services",
+  "forward_url": "/forward",
+  "logs_url": "/agent/logs",
+  "agent_action": "Call /agent/services next, then use /forward with the returned request templates.",
+  "safe_to_retry": true
+}
+```
+
+If the key is valid but no credentials are assigned, `status` is `needs_credentials` and `agent_action` tells the agent to ask the user to assign credentials in the dashboard.
+
+### POST /forward
+
+The core proxy endpoint. Authenticates the agent, evaluates policy, requests approval if needed, injects credentials, forwards the request, and sanitizes the response.
+
+#### Unified Mode (Recommended)
+
+Reference a credential by name. The proxy handles routing and auth injection automatically.
+
+**Headers:**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-TAP-Key` | yes | Agent API key |
+| `X-TAP-Credential` | yes | Credential name (no agent-ID prefix — just the plain name) |
+| `X-TAP-Target` | yes | Target API URL (or path if `relative_target` is set) |
+| `X-TAP-Method` | no | HTTP method to use upstream (default: GET) |
+| `X-TAP-Auth-Mode` | no | Rare escape hatch for hybrid X/Twitter credentials: `auto`, `bearer`, or `oauth1`. Normal requests should omit it. |
+
+**Example -- auto-approved GET:**
+
+```bash
+curl -X POST https://proxy.tap.human.tech/forward \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "X-TAP-Credential: slack" \
+  -H "X-TAP-Target: https://slack.com/api/conversations.list" \
+  -H "X-TAP-Method: GET"
+```
+
+**Example -- POST requiring approval:**
+
+```bash
+curl -X POST https://proxy.tap.human.tech/forward \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "X-TAP-Credential: slack" \
+  -H "X-TAP-Target: https://slack.com/api/chat.postMessage" \
+  -H "X-TAP-Method: POST" \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "C123456", "text": "Hello from my agent"}'
+```
+
+When approval is required, the proxy responds **202 Accepted immediately** with a transaction ID, an approval link, and a `poll_url`. The agent polls [`GET /agent/approvals/{txn_id}`](#get-agentapprovalstxn_id) until the status is `forwarded`, `denied`, or `timed_out` (approval window default: 1 hour). **Before making any write call, tell the user what you're about to send; after the 202, show them the approval link.** TAP includes a `notification_channel` field (`"dashboard"`, `"agent_reflected"`, `"telegram"`, or `"matrix"`) in the 202 response so you can tell the user where the approval prompt went.
+
+**Example 202 response:**
+
+```json
+{
+  "txn_id": "550e8400-e29b-41d4-a716-446655440000",
+  "poll_url": "/agent/approvals/550e8400-e29b-41d4-a716-446655440000",
+  "approval_dashboard_url": "https://app.tap.human.tech/dashboard#/approvals",
+  "approval_url": "https://app.tap.human.tech/approve/txn/550e8400-...",
+  "expires_in": 3600,
+  "status": "pending",
+  "notification_channel": "agent_reflected",
+  "agent_hint": "Approval required. Ask the user to open the dashboard or use the direct approval link. Then poll /agent/approvals/{txn_id} to check status."
+}
+```
+
+**Example -- sidecar with relative target:**
+
+```bash
+curl -X POST https://proxy.tap.human.tech/forward \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "X-TAP-Credential: telegram" \
+  -H "X-TAP-Target: /sendMessage" \
+  -H "X-TAP-Method: POST" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id": "123", "text": "Hello"}'
+```
+
+#### Legacy Placeholder Mode
+
+Use `<CREDENTIAL:name>` placeholders in headers or body. The proxy validates placeholder positions, then substitutes real values after approval.
+
+```bash
+curl -X POST https://proxy.tap.human.tech/forward \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "X-TAP-Target: https://api.openai.com/v1/chat/completions" \
+  -H "Authorization: Bearer <CREDENTIAL:openai-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+Placeholders are only allowed in auth-related positions. The proxy rejects requests where credentials appear in non-auth positions (tweet text, email body, etc.) to prevent exfiltration.
+
+#### Error Responses
+
+| Status | Meaning |
+|--------|---------|
+| 202 | Approval required — response carries `txn_id`, `approval_url`, and `poll_url` (not an error; poll for the outcome) |
+| 400 | Invalid request (missing headers, unknown `X-TAP-*` header, placeholder in non-auth position) |
+| 401 | Invalid or missing `X-TAP-Key` |
+| 403 | Credential not whitelisted for this agent |
+| 429 | Rate limit exceeded |
+| 502 | Upstream API error |
+| 503 | Transient database error — response includes `safe_to_retry: true`; retry rather than treating it as auth failure |
+
+All errors return JSON with an `error` field. Approval denial and timeout are **not** HTTP errors on `/forward` — they surface as `"denied"` / `"timed_out"` statuses on the poll endpoint.
+
+**Agent UX contract for writes:**
+1. Before the call: tell the user what you're about to post and that they'll get an approval request.
+2. On 202: show the user the `approval_url` (or relay `agent_hint`), then poll `poll_url`.
+3. On poll status `denied`: tell the user it was denied and ask whether to modify and retry.
+4. On poll status `timed_out`: tell the user the approval window expired and ask whether to retry — surface `notification_channel` from the 202 so they know where the original prompt went.
+
+### GET /agent/approvals/:txn_id
+
+Poll the status of a pending approval transaction returned by a 202 from `/forward`. Requires the same `X-TAP-Key` that created the transaction.
+
+```bash
+curl https://proxy.tap.human.tech/agent/approvals/$TXN_ID \
+  -H "X-TAP-Key: $MY_KEY"
+```
+
+**Response while pending:**
+
+```json
+{
+  "txn_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "created_at": "2026-06-05T14:22:15Z",
+  "expires_at": "2026-06-05T14:37:15Z"
+}
+```
+
+`status` is one of `pending`, `forwarded`, `denied`, or `timed_out`. When the request is approved and forwarded, the response includes the sanitized upstream result:
+
+```json
+{
+  "txn_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "forwarded",
+  "created_at": "2026-06-05T14:22:15Z",
+  "expires_at": "2026-06-05T14:37:15Z",
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body": "{\"ok\":true}",
+    "body_encoding": "utf-8",
+    "complete": true
+  }
+}
+```
+
+`body_encoding` is `"utf-8"` or `"base64"` (for binary upstream bodies). Returns `404` for unknown transactions and `403` for transactions created by a different agent.
+
+#### Driving an approval in code
+
+Embedding TAP in an SDK or non-conversational agent? Write **one** service-agnostic helper that forwards and polls — the target, method, body, and credential are all arguments, so the same function reaches any credential in the account (discover them via [`/agent/services`](#get-agentservices)). Don't hardcode a function per service.
+
+```python
+import json, time, urllib.request, urllib.error
+
+def tap_forward(base, key, target, method, body, cred_headers, timeout=300):
+    """Route any upstream call through TAP and poll to a terminal decision. Fail-closed."""
+    headers = {"X-TAP-Key": key, "X-TAP-Target": target, "X-TAP-Method": method.upper(),
+               "Content-Type": "application/json", **cred_headers}  # never real secrets
+    code, text = _http("POST", f"{base}/forward", headers, body.encode() if body else None)
+    parsed = _json(text)
+    if code != 202:                       # terminal already (auto-approved or error)
+        return {"ok": 200 <= code < 300, "status": code, "body": parsed}
+    txn = parsed.get("txn_id")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        _, ptext = _http("GET", f"{base}/agent/approvals/{txn}", {"X-TAP-Key": key}, None)
+        pr = _json(ptext)
+        state = pr.get("status")
+        if state == "forwarded":
+            up = pr.get("response") or {}
+            ok = isinstance(up.get("status"), int) and 200 <= up["status"] < 300
+            return {"ok": ok, "decision": "forwarded", "status": up.get("status"), "body": up.get("body")}
+        if state in ("denied", "timed_out", "error"):
+            return {"ok": False, "decision": state}
+    return {"ok": False, "decision": "timeout"}
+
+def _http(method, url, headers, data):
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+    except urllib.error.URLError as e:
+        return 0, json.dumps({"error": str(e.reason)})
+
+def _json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+```
+
+Two things to get right when real money or production is on the line:
+
+- **Fail closed.** Any non-`forwarded` outcome — denied, timed out, network error, malformed response — must be a failure that does **not** execute the action. The helper above returns `ok: true` only on a `forwarded` status with a `2xx` upstream response.
+- **Make retries idempotent.** If your poll deadline elapses while the human hasn't decided, you return a failure — but they can still approve later and the action *will* execute. Where the upstream supports an idempotency key, set a stable one per logical action so a retry can't double-submit.
+
+### GET /agent/services
+
+Returns available credentials for the authenticated agent. This is the agent's source of truth for request shape — use the returned `request_template` rather than guessing URL patterns or header names.
+
+**Single key (most common):**
+
+```bash
+curl https://proxy.tap.human.tech/agent/services \
+  -H "X-TAP-Key: $MY_KEY"
+```
+
+**Multiple keys — access credentials from several TAP accounts at once:**
+
+Pass a comma-separated list of API keys to merge credentials from multiple agents (whether they're in the same team or different teams) into one response:
+
+```bash
+curl https://proxy.tap.human.tech/agent/services \
+  -H "X-TAP-Key: $PERSONAL_KEY,$COMPANY_KEY"
+```
+
+In multi-key mode each credential name is prefixed with the agent ID it belongs to (e.g. `personal-agent.github`, `company-agent.slack`) so there are no collisions even if two accounts have a credential with the same name. The response includes an `accounts` map with `key_index` telling you which key to use per account when calling `/forward` — keys themselves are never returned.
+
+**Single-key response:**
+
+```json
+{
+  "agent_id": "my-agent",
+  "home_team_id": "abc-123",
+  "services": {
+    "slack": {
+      "description": "Slack API",
+      "target_shape": "full_url",
+      "target_base": "https://slack.com/api",
+      "approval": {
+        "default_decision": "pauses_for_human",
+        "url_match": "path_prefix_or_exact_host_path_prefix_with_star_segments",
+        "rules": [
+          { "target": "*", "methods": ["GET", "HEAD"], "decision": "proceeds_immediately" },
+          { "target": "*", "methods": ["POST", "PUT", "PATCH", "DELETE"], "decision": "pauses_for_human" }
+        ],
+        "note": "decision describes what TAP does, not what the agent must do. 'pauses_for_human' means TAP automatically routes the request to a human approver — the agent does not ask for approval itself, it just expects the call to block until a human responds. Rules are evaluated top to bottom; url_override rules win over method rules. A target starting with '/' matches the request URL path prefix; any other target requires an exact host match before matching the path prefix. In paths, '*' matches exactly one non-empty segment. Query strings and fragments do not participate."
+      },
+      "request_template": {
+        "method": "POST",
+        "url": "https://proxy.tap.human.tech/forward",
+        "headers": {
+          "X-TAP-Key": "$TAP_API_KEY",
+          "X-TAP-Credential": "slack",
+          "X-TAP-Target": "https://slack.com/api/<path>",
+          "X-TAP-Method": "GET|POST|PUT|PATCH|DELETE"
+        }
+      }
+    }
+  }
+}
+```
+
+**Multi-key response** (two keys sent, `personal-agent` at index 0, `company-agent` at index 1):
+
+```json
+{
+  "accounts": {
+    "personal-agent": { "agent_id": "personal-agent", "key_index": 0 },
+    "company-agent":  { "agent_id": "company-agent",  "key_index": 1 }
+  },
+  "services": {
+    "personal-agent.github": { "account": "personal-agent", "description": "GitHub", ... },
+    "company-agent.github":  { "account": "company-agent",  "description": "GitHub", ... },
+    "company-agent.slack":   { "account": "company-agent",  "description": "Slack",  ... }
+  }
+}
+```
+
+When calling `/forward` for a multi-key credential, use the key at `key_index` from the key list you sent, and strip the agent-ID prefix from the credential name:
+
+```bash
+# For company-agent.slack (key_index 1 → $COMPANY_KEY), credential name is just "slack"
+curl -X POST https://proxy.tap.human.tech/forward \
+  -H "X-TAP-Key: $COMPANY_KEY" \
+  -H "X-TAP-Credential: slack" \
+  -H "X-TAP-Target: https://slack.com/api/chat.postMessage" \
+  -H "X-TAP-Method: POST" \
+  -d '{"channel": "C123", "text": "hello"}'
+```
+
+Internal details (credential values, sidecar URLs, connector internals) are never returned. Agents should copy the `request_template` for a service, fill in a valid `X-TAP-Target`, and put write payloads in the HTTP body.
+
+### GET /agent/logs
+
+Returns recent audit log entries for the authenticated agent.
+
+```bash
+curl "https://proxy.tap.human.tech/agent/logs?limit=5" \
+  -H "X-TAP-Key: $MY_KEY"
+```
+
+**Query parameters:**
+
+| Param | Default | Max | Description |
+|-------|---------|-----|-------------|
+| `limit` | 20 | 100 | Number of entries to return |
+
+**Response:**
+
+```json
+{
+  "agent_id": "my-agent",
+  "count": 1,
+  "entries": [
+    {
+      "request_id": "550e8400-e29b-41d4-a716-446655440000",
+      "agent_id": "my-agent",
+      "credential_names": ["slack"],
+      "target_url": "https://slack.com/api/conversations.list",
+      "method": "GET",
+      "approval_status": null,
+      "upstream_status": 200,
+      "total_latency_ms": 145,
+      "approval_latency_ms": null,
+      "upstream_latency_ms": 120,
+      "response_sanitized": false,
+      "request_headers": [["X-TAP-Credential", "slack"]],
+      "request_body": null,
+      "request_body_truncated": false,
+      "policy_reason": "auto_approve_method",
+      "require_passkey": false,
+      "approver_identity": null,
+      "timestamp": "2026-03-30T14:22:15.123Z"
+    }
+  ]
+}
+```
+
+**Fields:**
+
+| Field | Description |
+|-------|-------------|
+| `approval_status` | `null` (no approval was required — see `policy_reason`), `"pending"`, `"approved"`, `"denied"`, or `"timeout"` |
+| `request_headers` / `request_body` | The request exactly as you sent it, **before** credential substitution — placeholders like `<CREDENTIAL:name>` or the `X-TAP-Credential` header are intact. The real injected secret is never stored or returned here. `request_body` is `null` when there was no body, the body wasn't valid UTF-8, or it exceeded the 16KB audit cap (see `request_body_truncated`) |
+| `policy_reason` | Which policy rule produced the decision, e.g. `auto_approve_url`, `auto_approve_method`, `require_approval_method`, `require_approval_default`, or a team-default reason like `team_gated_default_safe_method` |
+| `require_passkey` | Whether this credential's policy required passkey-strength approval |
+| `approver_identity` | Who resolved the approval, when known — a TAP account email for dashboard/agent-reflected/passkey approvals, or a messaging-platform identity (Telegram/Matrix user id) for messaging-channel approvals. `null` when auto-approved or unresolved |
+
+A request that required human approval (write methods, by default) now appears here too, once resolved — including denials and timeouts, not just successful forwards.
+
+### GET /agent/config
+
+Returns the credential list for the authenticated agent.
+
+```bash
+curl https://proxy.tap.human.tech/agent/config \
+  -H "X-TAP-Key: $MY_KEY"
+```
+
+**Response:**
+
+```json
+{
+  "agent_id": "my-agent",
+  "credentials": [
+    {
+      "name": "slack",
+      "description": "Slack API",
+      "api_base": "https://slack.com/api"
+    }
+  ]
+}
+```
+
+### POST /agent/proposals
+
+Propose a **policy change** for a human workspace manager to review. The proposal is inert — it never grants authority by itself; a manager approves or denies it in the dashboard (approval is passkey-gated). Capped at 20 pending proposals per agent (`429` beyond that).
+
+```bash
+curl -X POST https://proxy.tap.human.tech/agent/proposals \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "proposal_type": "policy_change",
+    "payload": {
+      "credential_name": "slack",
+      "auto_approve_urls": ["/conversations.list"],
+      "require_approval_urls": []
+    }
+  }'
+```
+
+Poll the decision with `GET /agent/proposals/{id}` (team-scoped, same `X-TAP-Key`). `auto_approve_urls` and `require_approval_urls` use structural URL matching: leading `/` matches the URL path prefix, host-qualified values require an exact host, and `*` matches one path segment. `require_approval_urls` are safety overrides and win over broader auto URL patterns.
+
+### POST /agent/credential-link
+
+Ask TAP for a prefilled dashboard link the agent can hand its user to create a **new credential**. The agent supplies metadata only (name, description, API base, `allowed_hosts`); any secret value in the payload is rejected with `400` — the human pastes the secret in the dashboard themselves.
+
+```bash
+curl -X POST https://proxy.tap.human.tech/agent/credential-link \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "digitalocean", "description": "DigitalOcean PAT", "api_base": "https://api.digitalocean.com", "allowed_hosts": ["api.digitalocean.com"]}'
+```
+
+Prefilling `allowed_hosts` opens the dashboard modal with the destination-host exfiltration binding already populated, so a secret-bearing credential is bound to its real upstream host rather than left unbound. It's still metadata only — the human reviews and saves.
+
+For APIs that authenticate via a non-`Authorization` header (e.g. `x-api-key`), prefill `auth_bindings` too. Each binding is `{ "header": "Header-Name", "format": "..." }`, and `format` **must** use the `{value}` placeholder — `{value}` for a single-secret credential, or `{value.<field>}` to reference one field of a multi-field credential. Do **not** use `{secret}`; it is rejected by the dashboard validator (`Auth binding must include {value} or {value.<key>}`).
+
+```bash
+curl -X POST https://proxy.tap.human.tech/agent/credential-link \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "pangram-text", "description": "Pangram AI text detection", "api_base": "https://text.external-api.pangram.com", "allowed_hosts": ["text.external-api.pangram.com"], "auth_bindings": [{"header": "x-api-key", "format": "{value}"}]}'
+```
+
+**Response:** `{"create_url": "https://.../dashboard?prefill_credential=...#/credentials"}`
+
+`name` must be 1-64 characters, lowercase alphanumeric plus hyphens (`^[a-z0-9-]{1,64}$`) — the same constraint the dashboard's own create-form input enforces. A name outside that charset (e.g. `google:workspace-admin`, `notion/api`) is rejected with `400` rather than handed to the human as a prefilled link their browser would refuse to submit.
+
+When a `/forward` call references a credential that doesn't exist, the error response includes a `credential_link_url` **only if** the attempted name is itself valid by that same rule (it's built from whatever the agent sent as `X-TAP-Credential`, which isn't pre-validated) — otherwise `agent_action` explains why no link was generated.
+
+### GET /health
+
+Health check endpoint. No authentication required.
+
+```bash
+curl https://proxy.tap.human.tech/health
+```
+
+Returns `200 OK` with `{"status": "ok", "build": {"sha": "...", "version": "..."}}` when the proxy is running.
+
+---
+
+## Admin Auth Endpoints
+
+These endpoints handle team signup, email verification, login, and logout. No authentication is required for signup and login.
+
+### POST /signup
+
+Create a new team and admin account.
+
+**Body:**
+
+```json
+{
+  "team_name": "my-team",
+  "email": "admin@example.com",
+  "password": "a-strong-password"
+}
+```
+
+**Validation:**
+- `team_name`: 3-64 characters, lowercase alphanumeric with hyphens
+- `email`: must contain `@` and `.`
+- `password`: minimum 8 characters
+
+**Response (201):**
+
+```json
+{
+  "team_id": "550e8400-e29b-41d4-a716-446655440000",
+  "team_name": "my-team",
+  "admin_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "message": "Verification email sent. Check your inbox."
+}
+```
+
+**curl example:**
+
+```bash
+curl -X POST https://proxy.tap.human.tech/signup \
+  -H "Content-Type: application/json" \
+  -d '{"team_name": "my-team", "email": "admin@example.com", "password": "my-password"}'
+```
+
+### POST /verify-email
+
+Verify email address with the 6-digit code sent during signup.
+
+**Body:**
+
+```json
+{
+  "email": "admin@example.com",
+  "code": "123456"
+}
+```
+
+**Response (200):**
+
+```json
+{"verified": true}
+```
+
+### POST /login
+
+Authenticate with email and password. Returns a session token valid for 24 hours.
+
+**Body:**
+
+```json
+{
+  "email": "admin@example.com",
+  "password": "my-password"
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "session_token": "a1b2c3d4e5f6...",
+  "admin_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "team_id": "550e8400-e29b-41d4-a716-446655440000",
+  "expires_at": "2026-04-03T14:00:00Z"
+}
+```
+
+**curl example:**
+
+```bash
+curl -X POST https://proxy.tap.human.tech/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@example.com", "password": "my-password"}'
+```
+
+### POST /logout
+
+Invalidate the current session.
+
+**Header:** `Authorization: Bearer <session_token>`
+
+```bash
+curl -X POST https://proxy.tap.human.tech/logout \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response (200):**
+
+```json
+{"logged_out": true}
+```
+
+---
+
+## Admin CRUD Endpoints
+
+Dashboard/team management endpoints require `Authorization: Bearer <session_token>`. Operations are scoped to the active team in that session.
+
+### Credentials
+
+Credential values are write-only. They are never returned by any API endpoint.
+
+#### GET /team/credentials
+
+List credentials for your team. Owners and admins see all credentials. Approvers see only credentials assigned to them on the Team page.
+
+```bash
+curl https://proxy.tap.human.tech/team/credentials \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "credentials": [
+    {
+      "name": "slack",
+      "description": "Slack API",
+      "connector": "direct",
+      "api_base": "https://slack.com/api",
+      "relative_target": false,
+      "auth_header_format": null,
+      "auth_bindings": [],
+      "value_hint": "xo***en"
+    }
+  ]
+}
+```
+
+`value_hint` is a masked preview (first and last two characters) confirming a value is stored — the value itself is never returned.
+
+#### POST /team/credentials
+
+Create a new credential. Owners and admins only.
+
+**Body:**
+
+```json
+{
+  "name": "slack",
+  "description": "Slack API",
+  "connector": "direct",
+  "api_base": "https://slack.com/api",
+  "relative_target": false,
+  "auth_header_format": "Bearer {value}",
+  "auth_bindings": [],
+  "value": "xoxb-your-slack-token"
+}
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `name` | yes | | Credential identifier |
+| `description` | yes | | Human-readable description |
+| `connector` | no | `"direct"` | `"direct"` (API key injection) or `"sidecar"` (external service) |
+| `api_base` | no | | Base URL for the target API or sidecar |
+| `relative_target` | no | `false` | If true, `X-TAP-Target` is a path appended to `api_base` |
+| `auth_header_format` | no | | Format string for the Authorization header (e.g., `"Bearer {value}"`) |
+| `auth_bindings` | no | `[]` | Explicit auth header bindings. Each binding is `{ "header": "Header-Name", "format": "{value}" }`. Use this for APIs that authenticate via non-Authorization headers. |
+| `value` | no | | The secret credential value (write-only, never returned) |
+
+`auth_bindings` is the recommended way to model APIs that use custom (non-`Authorization`) auth headers. When `auth_bindings` is set, TAP treats those headers as valid auth positions for placeholder substitution and injects them automatically in unified mode.
+
+**Multi-secret credentials (Datadog, and others)**
+
+APIs that need two or more independent secrets in one request are modeled as **one credential whose `value` is a JSON object** — `value` accepts either a string (single secret) or an object (multi-secret):
+
+```json
+{
+  "name": "datadog",
+  "description": "Datadog API + application keys",
+  "connector": "direct",
+  "auth_bindings": [
+    { "header": "DD-API-KEY", "format": "{value.api_key}" },
+    { "header": "DD-APPLICATION-KEY", "format": "{value.app_key}" }
+  ],
+  "value": { "api_key": "dd-api-key-here", "app_key": "dd-app-key-here" }
+}
+```
+
+With the bindings above, unified mode (`X-TAP-Credential: datadog`) injects both headers automatically. In placeholder mode, reference each field with the dotted form:
+
+```bash
+curl -X POST https://proxy.tap.human.tech/forward \
+  -H "X-TAP-Key: $MY_KEY" \
+  -H "X-TAP-Target: https://api.datadoghq.com/api/v1/validate" \
+  -H "X-TAP-Method: GET" \
+  -H "DD-API-KEY: <CREDENTIAL:datadog.api_key>" \
+  -H "DD-APPLICATION-KEY: <CREDENTIAL:datadog.app_key>"
+```
+
+Field references (`<CREDENTIAL:name.field>`) may appear in any header — the agent is explicitly choosing the wiring — but body position rules still apply, and a bare `<CREDENTIAL:name>` against a multi-secret credential is never substituted. The dashboard equivalent is the **Multi-secret** option on a Custom credential — see [Credential Setup](/credential-setup#multi-secret-apis-datadog-and-others).
+
+**curl example:**
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/credentials \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "slack",
+    "description": "Slack API",
+    "connector": "direct",
+    "api_base": "https://slack.com/api",
+    "value": "xoxb-your-slack-token"
+  }'
+```
+
+**Response (201):**
+
+```json
+{"name": "slack", "created": true}
+```
+
+#### DELETE /team/credentials/:name
+
+Delete a credential.
+
+```bash
+curl -X DELETE https://proxy.tap.human.tech/team/credentials/slack \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+### Agents
+
+#### GET /team/agents
+
+List API keys. Owners and admins see all team API keys. Approvers see only API keys they created themselves.
+
+```bash
+curl https://proxy.tap.human.tech/team/agents \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "agents": [
+    {
+      "id": "research-bot",
+      "description": "Research assistant",
+      "enabled": true,
+      "rate_limit_per_hour": 100,
+      "created_at": "2026-04-01T10:00:00Z"
+    }
+  ]
+}
+```
+
+#### POST /team/agents
+
+Create an API key. The key is returned once and cannot be retrieved again. Owners and admins can assign roles and direct credentials. Approvers can create keys only for themselves, using direct credentials already assigned to them; approver-created keys cannot use roles.
+
+**Body:**
+
+```json
+{
+  "id": "research-bot",
+  "description": "Research assistant",
+  "roles": ["reader"],
+  "credentials": ["slack"],
+  "rate_limit_per_hour": 100
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | yes | Agent identifier |
+| `description` | no | Human-readable description |
+| `roles` | no | List of role names to assign. Owners/admins only |
+| `credentials` | no | List of credential names for direct access. Approvers may include only credentials assigned to them |
+| `rate_limit_per_hour` | no | Max requests per hour (null = unlimited) |
+
+**curl example:**
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/agents \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "research-bot",
+    "description": "Research assistant",
+    "roles": ["reader"],
+    "credentials": ["slack"],
+    "rate_limit_per_hour": 100
+  }'
+```
+
+**Response (201):**
+
+```json
+{
+  "id": "research-bot",
+  "api_key": "a1b2c3d4e5f6...",
+  "message": "Save this API key — it will not be shown again."
+}
+```
+
+#### GET /team/agents/:id
+
+Get agent details including effective credentials (union of role credentials and direct assignments).
+
+```bash
+curl https://proxy.tap.human.tech/team/agents/research-bot \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "id": "research-bot",
+  "description": "Research assistant",
+  "enabled": true,
+  "rate_limit_per_hour": 100,
+  "created_at": "2026-04-01T10:00:00Z",
+  "effective_credentials": ["github", "slack"]
+}
+```
+
+#### DELETE /team/agents/:id
+
+```bash
+curl -X DELETE https://proxy.tap.human.tech/team/agents/research-bot \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+#### POST /team/agents/:id/enable
+
+Re-enable a disabled agent.
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/agents/research-bot/enable \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+#### POST /team/agents/:id/disable
+
+Disable an agent. All requests from this agent will be rejected until re-enabled.
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/agents/research-bot/disable \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+### Roles
+
+Roles provide RBAC for credential access. An agent's effective permissions are the union of all its roles' credentials plus its direct credential assignments.
+
+#### GET /team/roles
+
+```bash
+curl https://proxy.tap.human.tech/team/roles \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "roles": [
+    {
+      "name": "reader",
+      "description": "Read-only API access",
+      "rate_limit_per_hour": 50
+    }
+  ]
+}
+```
+
+#### POST /team/roles
+
+Create a role with optional initial credentials. Owners and admins only.
+
+**Body:**
+
+```json
+{
+  "name": "reader",
+  "description": "Read-only API access",
+  "credentials": ["slack", "github"],
+  "rate_limit_per_hour": 50
+}
+```
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/roles \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "reader", "description": "Read-only access", "credentials": ["slack", "github"]}'
+```
+
+#### DELETE /team/roles/:name
+
+Delete a role. Cascades -- removes the role from all agents.
+
+```bash
+curl -X DELETE https://proxy.tap.human.tech/team/roles/reader \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+### Policies
+
+Policies control per-credential approval behavior. See [Policies & Approval](/policies) for details on evaluation order.
+
+#### GET /team/policies/:cred_name
+
+```bash
+curl https://proxy.tap.human.tech/team/policies/slack \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "credential": "slack",
+  "auto_approve_methods": ["GET", "HEAD"],
+  "require_approval_methods": ["POST", "PUT", "DELETE"],
+  "auto_approve_urls": ["/conversations.list", "/users.list"],
+  "require_approval_urls": [],
+  "allowed_approvers": ["alice@example.com"],
+  "approval_channel": "dashboard",
+  "telegram_chat_id": "-100123456789",
+  "matrix_room_id": null,
+  "matrix_allowed_approvers": [],
+  "require_passkey": false,
+  "min_approvals": 1
+}
+```
+
+Returns `404` if no policy is set for the credential.
+
+#### PUT /team/policies/:cred_name
+
+Set or update the policy for a credential.
+
+**Body:**
+
+```json
+{
+  "auto_approve_methods": ["GET", "HEAD"],
+  "require_approval_methods": ["POST", "PUT", "DELETE"],
+  "auto_approve_urls": ["/conversations.list"],
+  "require_approval_urls": [],
+  "allowed_approvers": ["alice@example.com"],
+  "approval_channel": "telegram",
+  "telegram_chat_id": "-100123456789",
+  "matrix_room_id": "!roomid:matrix.org",
+  "matrix_allowed_approvers": ["@user:matrix.org"],
+  "require_passkey": false,
+  "min_approvals": 1
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `auto_approve_methods` | HTTP methods that skip approval |
+| `require_approval_methods` | HTTP methods that require human approval |
+| `auto_approve_urls` | Structural URL patterns that skip approval regardless of method. Values starting with `/` match the URL path prefix; other values require an exact host before matching the path prefix. In paths, `*` matches one non-empty segment. |
+| `require_approval_urls` | Structural URL patterns that always require approval. These are safety overrides evaluated before broader `auto_approve_urls` patterns and use the same `*` segment syntax. On update, omit to preserve the existing safety overrides; send `[]` to clear them. |
+| `allowed_approvers` | Team member emails allowed to approve. Empty = anyone on the team |
+| `approval_channel` | Optional per-credential channel override: `dashboard`, `agent_reflected`, `telegram`, or `matrix` |
+| `telegram_chat_id` | Override the default Telegram chat for this credential |
+| `matrix_room_id` | Override the default Matrix room for this credential |
+| `matrix_allowed_approvers` | Matrix-specific approver list (`@user:server` format) |
+| `require_passkey` | Require WebAuthn passkey (Face ID / YubiKey) for approval |
+| `min_approvals` | Number of approvers who must approve before proceeding (default 1) |
+
+**curl example:**
+
+```bash
+curl -X PUT https://proxy.tap.human.tech/team/policies/slack \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auto_approve_methods": ["GET"],
+    "require_approval_methods": ["POST", "PUT", "DELETE"],
+    "auto_approve_urls": ["/conversations.list", "/users.list"],
+    "require_approval_urls": []
+  }'
+```
+
+### Team
+
+#### GET /team
+
+Get your team information.
+
+```bash
+curl https://proxy.tap.human.tech/team \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "my-team",
+  "created_at": "2026-04-01T00:00:00Z"
+}
+```
+
+### Notification Channels
+
+Configure where approval requests are sent for your team.
+
+#### GET /team/notification-channels
+
+```bash
+curl https://proxy.tap.human.tech/team/notification-channels \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "notification_channels": [
+    {
+      "id": "ch-1",
+      "channel_type": "telegram",
+      "name": "ops-channel",
+      "config": {"chat_id": "-100123456789"},
+      "enabled": true,
+      "created_at": "2026-04-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+#### POST /team/notification-channels
+
+Create a notification channel. Supports `telegram`, `matrix`, `dashboard`, and `agent_reflected`.
+
+`dashboard` and `agent_reflected` do not require external config:
+
+```json
+{
+  "channel_type": "dashboard",
+  "name": "dashboard",
+  "config": {}
+}
+```
+
+```json
+{
+  "channel_type": "agent_reflected",
+  "name": "agent-reflected",
+  "config": {}
+}
+```
+
+**Telegram:**
+
+```json
+{
+  "channel_type": "telegram",
+  "name": "ops-channel",
+  "config": {"chat_id": "-100123456789"}
+}
+```
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/notification-channels \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"channel_type": "telegram", "name": "ops-channel", "config": {"chat_id": "-100123456789"}}'
+```
+
+**Matrix:**
+
+```json
+{
+  "channel_type": "matrix",
+  "name": "ops-matrix",
+  "config": {
+    "room_id": "!yourroom:matrix.org",
+    "homeserver_url": "https://matrix.org"
+  }
+}
+```
+
+`homeserver_url` is optional if the server has a Matrix bot configured with a default homeserver. Do not include `access_token` — that is a global secret managed by the server.
+
+#### POST /team/notification-channels/:name/default
+
+Make a channel the team default — it is tried first when routing approval requests.
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/notification-channels/ops-channel/default \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+#### POST /team/notification-channels/:name/test
+
+Send a test message through a channel to verify it's wired up.
+
+```bash
+curl -X POST https://proxy.tap.human.tech/team/notification-channels/ops-channel/test \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```
+
+#### DELETE /team/notification-channels/:name
+
+```bash
+curl -X DELETE https://proxy.tap.human.tech/team/notification-channels/ops-channel \
+  -H "Authorization: Bearer $SESSION_TOKEN"
+```

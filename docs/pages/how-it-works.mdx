@@ -1,0 +1,87 @@
+# How It Works
+
+## Architecture
+
+TAP is a Rust proxy (axum) backed by an encrypted configuration store. Managed hosting uses Postgres; self-hosted deployments initialize the same schema through the proxy. Credential values are encrypted at rest with AES-256-GCM. There is no config file — everything is managed via the dashboard or API.
+
+| Component | Purpose |
+|-----------|---------|
+| Proxy | HTTP service: auth, policy, credential injection, forwarding, response sanitization |
+| Approval channels | Deliver approve/deny requests: dashboard inbox, agent-reflected links, Telegram, Matrix |
+| Inline OAuth and token handling | Direct Bearer-token injection, Google OAuth 2.0 token refresh, and Twitter/X OAuth 1.0a request signing inside the proxy |
+| CLI (`tap`) | Local management tool for self-hosted deployments |
+
+**Managed hosting runs inside a hardware enclave** (Azure confidential containers on AMD SEV-SNP). The encryption key exists in plaintext only inside enclave memory — and the key that unwraps it is released by Azure Key Vault's HSM only to a hardware-attested TAP image running the exact published code. Not to the network, the OS, the host, our cloud account, or us. Credential values are protected even against a compromised platform operator. See the [Security Model](/security) for the full chain of custody and how to verify it.
+
+## How Agents Use TAP
+
+The agent sends a credential name via the `X-TAP-Credential` header. The proxy handles everything else — auth header injection, OAuth signing, sidecar routing. The agent never knows whether the credential is a simple API key or requires OAuth.
+
+```
+POST /forward
+X-TAP-Key: <agent-api-key>
+X-TAP-Credential: slack
+X-TAP-Target: https://slack.com/api/conversations.list
+X-TAP-Method: GET
+```
+
+## Request Flow
+
+```
+Agent request
+  |
+  v
+Authentication (X-TAP-Key -> agent lookup)
+  |
+  v
+Rate limit check (per-agent hourly limit)
+  |
+  v
+Credential check (is this credential allowed for this agent?)
+  |
+  v
+Policy evaluation
+  |
+  +-- Auto-approved -> skip to Forward
+  |
+  v
+Human approval — agent receives 202 + approval link and polls for the outcome
+(dashboard, agent-reflected link, Telegram, Matrix, and optional passkey step-up)
+  |
+  v
+Credential injection + forward to target API
+  |
+  v
+Response sanitization (scrub credential values)
+  |
+  v
+Audit log + response returned to agent (directly, or via the poll endpoint for approved writes)
+```
+
+## Key Concepts
+
+| Concept | What it means |
+|---------|--------------|
+| **Credential** | An API key, OAuth token, or other secret. Stored encrypted, never shown to agents or admins |
+| **Agent** | An AI system with a unique API key. References credentials by name |
+| **Role** | Groups credentials for RBAC. Owner/admin-managed agents can use roles plus direct assignments. Approver-created agents use direct assignments only |
+| **Policy** | Per-credential rules: which requests run automatically, which have more complex policies |
+| **Team** | Isolation boundary. Each team has its own credentials, agents, roles, and policies |
+
+## Response Sanitization
+
+Before returning API responses to the agent, the proxy scans for credential leakage:
+
+1. **Exact match** — the literal credential value
+2. **Base64 variant** — the base64-encoded credential
+3. **URL-encoded variant** — the percent-encoded credential
+
+Matches are replaced with `[REDACTED:credential-name]`. Responses larger than 10 MB pass through without scanning.
+
+## Trust Model
+
+- **Agents are untrusted** — they authenticate with API keys but cannot access credential values, bypass policy, or see unsanitized responses
+- **Approvers are semi-trusted** — they see request details (URL, method, body preview) but not credential values
+- **Admins can configure but not read credentials** — admins manage which credentials exist and what policies apply, but credential values are write-only: they are encrypted on save and never returned by any API endpoint, dashboard, or export. An admin account compromise lets an attacker change configuration, not exfiltrate secrets.
+- **The enclave protects against everyone** — on managed hosting, decryption keys are released only to the attested enclave image ([Security Model](/security)), so credential values are protected even if the server, the database, or the platform operator is compromised
+- **Approval records are short-lived** — request body previews and upstream response bodies (e.g. AI-generated content) stored during the approval flow are deleted as soon as the agent receives its decision. Any residual records are purged within minutes by a background cleanup job. Credential values are never stored in approval records at any point.

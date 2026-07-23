@@ -1,0 +1,31 @@
+name: OSS CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: tap
+          POSTGRES_USER: tap
+          POSTGRES_PASSWORD: tap
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_DATABASE_URL: postgres://tap:tap@localhost:5432/tap
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Rust tests
+        run: cargo test --workspace -- --test-threads=1

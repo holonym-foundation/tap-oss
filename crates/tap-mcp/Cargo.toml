@@ -1,0 +1,36 @@
+[package]
+name = "tap-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Remote MCP server for TAP"
+
+[dependencies]
+# NOTE: tap-mcp deliberately depends on NEITHER `tap-core` NOR `sqlx`.
+# It is an internet-facing OAuth server running OUTSIDE the attested Azure
+# confidential container group that tap-proxy runs in. A database connection
+# string here would be a live credential for the database holding encrypted
+# credential blobs — the wrong side of the enclave boundary. Its three
+# token-state operations (record family / rotate family / consume auth code)
+# go over the proxy's authenticated /internal/mcp endpoints instead.
+axum = "0.8"
+base64 = "0.22"
+chrono = { workspace = true }
+hmac = "0.12"
+http = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "2.2.0", features = ["transport-streamable-http-server"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = "0.7"
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = "0.5"
