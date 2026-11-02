@@ -6584,7 +6584,17 @@ pub fn build_router(state: AppState) -> axum::Router {
             agent_session_guard,
         ))
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        // Axum defaults to a 2 MiB request body. Nobody chose that number for TAP, and it is the
+        // ceiling an agent meets when it forwards anything substantial through the proxy — a file
+        // into a repository, a document into a vendor API — with no way to split one request into
+        // several. The caller sees "Failed to buffer the request body: length limit exceeded",
+        // which reads like a bug in their own code. 32 MiB carries that work and still refuses a
+        // body that could only be a mistake or an attack.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
 }
+
+/// Largest request body the proxy will buffer, replacing axum's 2 MiB default.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -6843,6 +6853,32 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (url, handle, recorded)
+    }
+
+    // Regression: axum's default 2 MiB body cap applied to every forwarded request, so an agent
+    // pushing a file of any size got a 413 it could do nothing about.
+    #[tokio::test]
+    async fn forward_accepts_a_body_above_the_axum_default() {
+        let (upstream_url, _h, _rec) = start_mock_upstream().await;
+        let mock = Arc::new(MockApproval {
+            auto_approve: true,
+            calls: std::sync::Mutex::new(vec![]),
+        });
+        let (state, _audit, _tmp) = make_state(mock.clone()).await;
+        let app = build_router(state.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/forward")
+            .header("x-tap-key", "test-api-key-12345")
+            .header("x-tap-target", format!("{upstream_url}/ok"))
+            .header("x-tap-method", "POST")
+            .header("authorization", "Bearer <CREDENTIAL:test-cred>")
+            .body(Body::from(vec![b'x'; 3 * 1024 * 1024]))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
